@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
@@ -36,6 +37,15 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
     This is the brain's only real entrypoint for a conversational turn. It
     does not know or care whether the caller is "web", "ios", or "laptop" —
     every plugin builds a BrainInput and funnels through here.
+
+    Performance note: message persistence never blocks reasoning. Every DB
+    write below (Supabase's client is sync, so each `.execute()` would
+    otherwise stall the whole request) is dispatched via `asyncio.to_thread`
+    and collected in `pending_writes` — the model only ever needs the
+    in-memory `messages` list, never the DB row, so writes overlap with the
+    next model call instead of adding to the critical path serially. They're
+    all awaited together right before `brain.done` so a write failure still
+    surfaces, just without costing latency along the way.
     """
     ctx = CognitionContext(
         user_id=input.user_id,
@@ -44,6 +54,12 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
         supabase=supabase,
     )
     conversation_id = ctx.conversation_id
+    pending_writes: list[asyncio.Task] = []
+
+    def bg_insert(table: str, payload: dict[str, Any]) -> None:
+        pending_writes.append(
+            asyncio.create_task(asyncio.to_thread(lambda: ctx.supabase.table(table).insert(payload).execute()))
+        )
 
     # UNDERSTAND — establish which conversation this turn belongs to.
     if conversation_id is None:
@@ -58,11 +74,8 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
         )
         yield BrainEvent(type="brain.conversation_started", data={"id": conversation_id})
 
-    # REMEMBER — persist the new input, then load the full conversation.
-    ctx.supabase.table("messages").insert(
-        {"conversation_id": conversation_id, "role": "user", "content": input.content}
-    ).execute()
-
+    # REMEMBER — load prior turns; the new message is appended in-memory below
+    # and persisted in the background (see docstring).
     history = (
         ctx.supabase.table("messages")
         .select("role, content, tool_calls, tool_call_id")
@@ -70,9 +83,11 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
         .order("created_at")
         .execute()
     )
+    bg_insert("messages", {"conversation_id": conversation_id, "role": "user", "content": input.content})
 
     messages: list[ChatMessage] = [ChatMessage(role="system", content=SYSTEM_PROMPT)]
     messages.extend(_row_to_chat_message(row) for row in history.data)
+    messages.append(ChatMessage(role="user", content=input.content))
 
     provider = get_model_provider()
     tool_defs = get_tool_definitions()
@@ -95,19 +110,21 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
 
         if not tool_calls:
             if assistant_content:
-                ctx.supabase.table("messages").insert(
-                    {"conversation_id": conversation_id, "role": "assistant", "content": assistant_content}
-                ).execute()
+                bg_insert(
+                    "messages",
+                    {"conversation_id": conversation_id, "role": "assistant", "content": assistant_content},
+                )
             break
 
-        ctx.supabase.table("messages").insert(
+        bg_insert(
+            "messages",
             {
                 "conversation_id": conversation_id,
                 "role": "assistant",
                 "content": assistant_content,
                 "tool_calls": [tc.__dict__ for tc in tool_calls],
-            }
-        ).execute()
+            },
+        )
         messages.append(ChatMessage(role="assistant", content=assistant_content, tool_calls=tool_calls))
 
         # ACT — execute each requested tool under the security/permission gate.
@@ -126,18 +143,24 @@ async def run(input: BrainInput, supabase: Client) -> AsyncIterator[BrainEvent]:
             yield BrainEvent(type="brain.tool_finished", data={"name": call.name, "status": result.status})
 
             tool_result_content = json.dumps(result.output if result.status == "success" else {"error": result.error})
-            ctx.supabase.table("messages").insert(
+            bg_insert(
+                "messages",
                 {
                     "conversation_id": conversation_id,
                     "role": "tool",
                     "content": tool_result_content,
                     "tool_call_id": call.id,
                     "tool_name": call.name,
-                }
-            ).execute()
+                },
+            )
             messages.append(ChatMessage(role="tool", content=tool_result_content, tool_call_id=call.id))
 
-    ctx.supabase.table("conversations").update(
-        {"updated_at": datetime.now(timezone.utc).isoformat()}
-    ).eq("id", conversation_id).execute()
+    def touch_conversation() -> None:
+        ctx.supabase.table("conversations").update(
+            {"updated_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", conversation_id).execute()
+
+    pending_writes.append(asyncio.create_task(asyncio.to_thread(touch_conversation)))
+    await asyncio.gather(*pending_writes, return_exceptions=True)
+
     yield BrainEvent(type="brain.done")

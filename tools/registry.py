@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -58,27 +59,27 @@ async def execute_tool(
     # silently executing.
     if requires_confirmation(tool.permission):
         reason = "This action requires user confirmation, which is not yet wired up."
-        await _log_tool_call(ctx, tool.name, tool.permission, raw_input, None, "denied", conversation_id, message_id, reason)
+        _log_tool_call(ctx, tool.name, tool.permission, raw_input, None, "denied", conversation_id, message_id, reason)
         return ToolExecutionResult(status="denied", error=reason)
 
     try:
         parsed = tool.input_model(**raw_input)
     except ValidationError as e:
         error = f"Invalid arguments: {e}"
-        await _log_tool_call(ctx, tool.name, tool.permission, raw_input, None, "error", conversation_id, message_id, error)
+        _log_tool_call(ctx, tool.name, tool.permission, raw_input, None, "error", conversation_id, message_id, error)
         return ToolExecutionResult(status="error", error=error)
 
     try:
         output = await tool.execute(parsed, ctx)
-        await _log_tool_call(ctx, tool.name, tool.permission, parsed.model_dump(), output, "success", conversation_id, message_id)
+        _log_tool_call(ctx, tool.name, tool.permission, parsed.model_dump(), output, "success", conversation_id, message_id)
         return ToolExecutionResult(status="success", output=output)
     except Exception as e:  # noqa: BLE001 — tool execution is arbitrary; surface it as a tool error, not a 500
         error = str(e)
-        await _log_tool_call(ctx, tool.name, tool.permission, parsed.model_dump(), None, "error", conversation_id, message_id, error)
+        _log_tool_call(ctx, tool.name, tool.permission, parsed.model_dump(), None, "error", conversation_id, message_id, error)
         return ToolExecutionResult(status="error", error=error)
 
 
-async def _log_tool_call(
+def _log_tool_call(
     ctx: CognitionContext,
     tool_name: str,
     permission: str,
@@ -89,16 +90,25 @@ async def _log_tool_call(
     message_id: str | None,
     error: str | None = None,
 ) -> None:
-    ctx.supabase.table("tool_calls").insert(
-        {
-            "user_id": ctx.user_id,
-            "conversation_id": conversation_id,
-            "message_id": message_id,
-            "tool_name": tool_name,
-            "permission_level": permission,
-            "input": input_data,
-            "output": output,
-            "status": status,
-            "error": error,
-        }
-    ).execute()
+    # Fire-and-forget: this is an audit trail, not something the current turn's
+    # response should wait on. A logging failure shouldn't surface as a user-
+    # visible tool error, so it's swallowed here rather than propagated.
+    def write() -> None:
+        try:
+            ctx.supabase.table("tool_calls").insert(
+                {
+                    "user_id": ctx.user_id,
+                    "conversation_id": conversation_id,
+                    "message_id": message_id,
+                    "tool_name": tool_name,
+                    "permission_level": permission,
+                    "input": input_data,
+                    "output": output,
+                    "status": status,
+                    "error": error,
+                }
+            ).execute()
+        except Exception:  # noqa: BLE001 — best-effort audit log, never fail the calling turn
+            pass
+
+    asyncio.create_task(asyncio.to_thread(write))
